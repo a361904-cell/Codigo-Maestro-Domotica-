@@ -1,0 +1,397 @@
+/*
+ * CÓDIGO MAESTRO COMPLETO - 3 SERVOS (VENTANA EN PIN 9 AJUSTADA) + CLIMA + ANTIRROBO
+ * Proyecto: Sistema Domótico Asistencial (Aging in Place)
+ * Autor: Tadeo Andrei Nieto Paz
+ *
+ * Pin D2:  Botón Verde -> Controla Servomotor 1 (Pin 10 - Puerta) y desactiva SOS
+ * Pin D3:  Módulo LED Rojo (PCB0107)
+ * Pin D4:  Botón Rojo (Emergencia SOS -> Abre y deja fijos los 3 Servos)
+ * Pin D5:  Módulo Buzzer
+ * Pin D6:  Módulo LED Blanco (Iluminación por Aplauso y Alarma)
+ * Pin D7:  Sensor de Sonido / Micrófono
+ * Pin D8:  Sensor Infrarrojo -> Controla Servomotor 2 (Pin 9 - Ventana)
+ * Pin D9:  Servomotor 2 (Ventana - Ajustado con ángulos seguros y 900 ms)
+ * Pin D10: Servomotor 1 (Puerta Principal 70° a 160°)
+ * Pin D11: Servomotor 3 (Barrera "P" de Acceso 70° a 160°)
+ * Pin D12: Fotointerruptor en "U" (Lector de Tarjeta -> Controla Servomotor 3)
+ * Pin D13: Motor del Ventilador (Climatización automática con DHT11)
+ * Pin A0:  Sensor de Lluvia en Techo
+ * Pin A1:  TRIG del Sensor Ultrasónico (Alarma Antirrobo Exterior)
+ * Pin A2:  ECHO del Sensor Ultrasónico (Alarma Antirrobo Exterior)
+ * Pin A3:  Sensor de Temperatura y Humedad DHT11
+ * Puerto IIC (SDA/SCL - Usa A4 y A5 internamente): Pantalla LCD 1602
+ */
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+#include <DHT.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// --- DEFINICIÓN DE PINES ---
+const int BOTON_VERDE = 2;     
+const int LED_ROJO = 3;        
+const int BOTON_ROJO = 4;      
+const int BUZZER_PIN = 5;      
+const int LED_BLANCO = 6;      
+const int SENSOR_SONIDO = 7;   
+const int SENSOR_IR = 8;       
+const int SERVO_2 = 9;         // Servo 2 (Ventana) en Pin D9
+const int SERVO_1 = 10;        // Servo 1 (Puerta) en Pin D10
+const int SERVO_3 = 11;        // Servo 3 (Barrera "P") en Pin D11
+const int LECTOR_TARJETA = 12; // Fotointerruptor en "U" en Pin D12
+const int PIN_VENTILADOR = 13; // Motor del ventilador en Pin D13
+const int SENSOR_LLUVIA = A0;  
+const int PIN_TRIG = A1;       // Pin TRIG del Ultrasónico
+const int PIN_ECHO = A2;       // Pin ECHO del Ultrasónico
+const int PIN_DHT = A3;        // Sensor DHT11 en Pin A3
+
+#define DHTTYPE DHT11
+DHT dht(PIN_DHT, DHTTYPE);
+
+// --- ÁNGULOS DE LOS 3 SERVOMOTORES ---
+const int ANGULO_CERRADO = 70;   // Servo 1 (Pin 10 - Puerta)
+const int ANGULO_ABIERTO = 160;  
+
+// ÁNGULOS DE LA VENTANA (PIN 9):
+// (Si notas que la ventana hace el movimiento al revés, pon CERRADO = 170 y ABIERTO = 15)
+const int SERVO2_CERRADO = 15;   // Servo 2 (Pin 9 - Ventana cerrada sin trabarse en 0°)
+const int SERVO2_ABIERTO = 170;  // Servo 2 (Pin 9 - Ventana abierta)
+
+const int SERVO3_CERRADO = 70;   // Servo 3 (Pin 11 - Barrera "P")
+const int SERVO3_ABIERTO = 160;  
+
+// --- UMBRALES DE CALIBRACIÓN ---
+const int UMBRAL_AGUA = 300;     // > 300 indica lluvia
+const float TEMP_MAXIMA = 18.0;  // Temperatura (°C) a la que enciende el ventilador
+const int DISTANCIA_ROBO = 10;   // Distancia en cm (10 cm o menos dispara alarma de robo)
+
+Servo miServo1; // Pin 10
+Servo miServo2; // Pin 9 (Ventana)
+Servo miServo3; // Pin 11
+
+bool puerta1Abierta = false;
+bool puerta2Abierta = false;
+bool barrera3Abierta = false;
+bool luzBlancaEncendida = false;
+bool ventiladorEncendido = false;
+bool emergenciaActiva = false;
+
+int estadoAnteriorSonido = LOW;
+int estadoAnteriorIR = HIGH;
+int estadoAnteriorTarjeta = LOW;
+
+unsigned long ultimoReporteClima = 0;
+unsigned long ultimoChequeoUltrasonico = 0;
+
+void mostrarEnLCD(String linea1, String linea2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(linea1);
+  lcd.setCursor(0, 1);
+  lcd.print(linea2);
+}
+
+// Mueve un servo a la vez pausando el ventilador para proteger la fuente de 9V 1000mA
+void accionarServoSeguro(Servo &servoObj, int pinServo, int anguloDestino, int tiempoMovimiento) {
+  if (ventiladorEncendido) {
+    digitalWrite(PIN_VENTILADOR, LOW);
+    delay(100);
+  }
+
+  servoObj.attach(pinServo);
+  servoObj.write(anguloDestino);
+  delay(tiempoMovimiento);
+  servoObj.detach();
+  delay(450);
+
+  if (ventiladorEncendido) {
+    digitalWrite(PIN_VENTILADOR, HIGH);
+  }
+}
+
+// Fuerza el cierre de Puerta, Ventana (Pin 9) y Barrera sin importar cómo estaban antes
+void cerrarTodoForzado() {
+  accionarServoSeguro(miServo1, SERVO_1, ANGULO_CERRADO, 550);
+  puerta1Abierta = false;
+
+  accionarServoSeguro(miServo2, SERVO_2, SERVO2_CERRADO, 900); // 900 ms para que la ventana cierre completo
+  puerta2Abierta = false;
+
+  accionarServoSeguro(miServo3, SERVO_3, SERVO3_CERRADO, 550);
+  barrera3Abierta = false;
+}
+
+long medirDistanciaCM() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  
+  long duracion = pulseIn(PIN_ECHO, HIGH, 25000);
+  if (duracion == 0) return 999;
+  return duracion * 0.034 / 2;
+}
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  
+  lcd.init();
+  lcd.backlight();
+  mostrarEnLCD("INICIANDO CASA..", "CERRANDO ACCESOS");
+  
+  pinMode(BOTON_VERDE, INPUT_PULLUP);
+  pinMode(BOTON_ROJO, INPUT_PULLUP);
+  pinMode(SENSOR_SONIDO, INPUT);
+  pinMode(SENSOR_IR, INPUT);
+  pinMode(LECTOR_TARJETA, INPUT);
+  pinMode(SENSOR_LLUVIA, INPUT);
+  
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  
+  pinMode(LED_ROJO, OUTPUT);
+  pinMode(LED_BLANCO, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(PIN_VENTILADOR, OUTPUT);
+  
+  digitalWrite(PIN_TRIG, LOW);
+  digitalWrite(LED_ROJO, LOW);
+  digitalWrite(LED_BLANCO, LOW);
+  digitalWrite(PIN_VENTILADOR, LOW);
+  noTone(BUZZER_PIN);
+
+  // Cierra puertas y ventana al encender el Arduino
+  cerrarTodoForzado();
+  mostrarEnLCD("SISTEMA DOMOTICO", " SEGURIDAD 100% ");
+
+  estadoAnteriorSonido = digitalRead(SENSOR_SONIDO);
+  estadoAnteriorIR = digitalRead(SENSOR_IR);
+  estadoAnteriorTarjeta = digitalRead(LECTOR_TARJETA);
+  
+  Serial.println("=== SISTEMA LISTO: PUERTA, VENTANA (PIN 9) Y BARRERA ===");
+}
+
+void loop() {
+  int estadoVerde = digitalRead(BOTON_VERDE);
+  int estadoRojo = digitalRead(BOTON_ROJO);
+  int lecturaSonido = digitalRead(SENSOR_SONIDO);
+  int lecturaIR = digitalRead(SENSOR_IR);
+  int lecturaTarjeta = digitalRead(LECTOR_TARJETA);
+  int nivelLluvia = analogRead(SENSOR_LLUVIA);
+
+  // --- 1. BOTÓN VERDE (PIN 2) -> CONTROLA SERVO 1 (PIN 10 - PUERTA) ---
+  if (estadoVerde == LOW) {
+    emergenciaActiva = false;
+    puerta1Abierta = !puerta1Abierta;
+
+    if (puerta1Abierta) {
+      mostrarEnLCD("BOTON VERDE", "PUERTA 1 ABIERTA");
+      digitalWrite(LED_ROJO, HIGH);
+      tone(BUZZER_PIN, 1200);
+      delay(150);
+      noTone(BUZZER_PIN);
+      accionarServoSeguro(miServo1, SERVO_1, ANGULO_ABIERTO, 550);
+    }
+    else {
+      mostrarEnLCD("BOTON VERDE", "PUERTA 1 CERRADA");
+      digitalWrite(LED_ROJO, LOW);
+      tone(BUZZER_PIN, 800);
+      delay(150);
+      noTone(BUZZER_PIN);
+      accionarServoSeguro(miServo1, SERVO_1, ANGULO_CERRADO, 550);
+    }
+    estadoAnteriorSonido = digitalRead(SENSOR_SONIDO);
+  }
+
+  // --- 2. SENSOR INFRARROJO (PIN 8) -> CONTROLA SERVO 2 (PIN 9 - VENTANA) ---
+  if (lecturaIR != estadoAnteriorIR) {
+    if (lecturaIR == LOW) {
+      puerta2Abierta = !puerta2Abierta;
+
+      if (puerta2Abierta) {
+        mostrarEnLCD("SENSOR MANO IR", "VENTANA ABIERTA");
+        tone(BUZZER_PIN, 1400);
+        delay(120);
+        noTone(BUZZER_PIN);
+        accionarServoSeguro(miServo2, SERVO_2, SERVO2_ABIERTO, 900);
+      }
+      else {
+        mostrarEnLCD("SENSOR MANO IR", "VENTANA CERRADA");
+        tone(BUZZER_PIN, 900);
+        delay(120);
+        noTone(BUZZER_PIN);
+        accionarServoSeguro(miServo2, SERVO_2, SERVO2_CERRADO, 900);
+      }
+      estadoAnteriorSonido = digitalRead(SENSOR_SONIDO);
+    }
+    estadoAnteriorIR = digitalRead(SENSOR_IR);
+  }
+
+  // --- 3. FOTOINTERRUPTOR EN "U" (PIN 12) -> CONTROLA SERVO 3 (PIN 11 - BARRERA) ---
+  if (lecturaTarjeta != estadoAnteriorTarjeta) {
+    if (lecturaTarjeta == HIGH) {
+      barrera3Abierta = !barrera3Abierta;
+
+      if (barrera3Abierta) {
+        mostrarEnLCD("TARJETA VALIDA", "BARRERA P: ABRIR");
+        tone(BUZZER_PIN, 1600);
+        delay(150);
+        noTone(BUZZER_PIN);
+        accionarServoSeguro(miServo3, SERVO_3, SERVO3_ABIERTO, 550);
+      }
+      else {
+        mostrarEnLCD("TARJETA VALIDA", "BARRERA P: CIERRA");
+        tone(BUZZER_PIN, 1000);
+        delay(150);
+        noTone(BUZZER_PIN);
+        accionarServoSeguro(miServo3, SERVO_3, SERVO3_CERRADO, 550);
+      }
+      estadoAnteriorSonido = digitalRead(SENSOR_SONIDO);
+    }
+    estadoAnteriorTarjeta = digitalRead(LECTOR_TARJETA);
+  }
+
+  // --- 4. BOTÓN ROJO SOS -> ALARMA + DEJA LOS 3 ACCESOS ABIERTOS FIJOS ---
+  if (estadoRojo == LOW) {
+    emergenciaActiva = true;
+    ventiladorEncendido = false;
+    digitalWrite(PIN_VENTILADOR, LOW);
+
+    mostrarEnLCD("! ALERTA SOS !", "SONANDO ALARMA..");
+    digitalWrite(LED_BLANCO, HIGH);
+    luzBlancaEncendida = true;
+
+    for (int i = 0; i < 4; i++) {
+      digitalWrite(LED_ROJO, HIGH);
+      tone(BUZZER_PIN, 1500);
+      delay(180);
+      digitalWrite(LED_ROJO, LOW);
+      tone(BUZZER_PIN, 900);
+      delay(180);
+    }
+    noTone(BUZZER_PIN);
+    digitalWrite(LED_ROJO, HIGH);
+    delay(300);
+
+    mostrarEnLCD("! EMERGENCIA !", "ABRIENDO TODO...");
+
+    accionarServoSeguro(miServo1, SERVO_1, ANGULO_ABIERTO, 550);
+    puerta1Abierta = true;
+
+    accionarServoSeguro(miServo2, SERVO_2, SERVO2_ABIERTO, 900);
+    puerta2Abierta = true;
+
+    accionarServoSeguro(miServo3, SERVO_3, SERVO3_ABIERTO, 550);
+    barrera3Abierta = true;
+
+    mostrarEnLCD("! EMERGENCIA !", "ABIERTAS FIJAS");
+    delay(300);
+    estadoAnteriorSonido = digitalRead(SENSOR_SONIDO);
+  }
+
+  // --- 5. SENSOR DE SONIDO (LUZ BLANCA POR APLAUSO) ---
+  if (lecturaSonido != estadoAnteriorSonido) {
+    if (lecturaSonido == HIGH) {
+      luzBlancaEncendida = !luzBlancaEncendida;
+      digitalWrite(LED_BLANCO, luzBlancaEncendida ? HIGH : LOW);
+      mostrarEnLCD("CONTROL DE VOZ", luzBlancaEncendida ? "LUZ BLANCA: ON" : "LUZ BLANCA: OFF");
+      delay(400);
+    }
+    estadoAnteriorSonido = digitalRead(SENSOR_SONIDO);
+  }
+
+  // --- 6. SENSOR DE LLUVIA (A0) -> CIERRA PUERTA, VENTANA (PIN 9) Y BARRERA ---
+  if (!emergenciaActiva && nivelLluvia > UMBRAL_AGUA && (puerta1Abierta || puerta2Abierta || barrera3Abierta)) {
+    mostrarEnLCD("ALERTA: LLUVIA", "CERRANDO CASA...");
+    tone(BUZZER_PIN, 1000);
+    delay(250);
+    noTone(BUZZER_PIN);
+    delay(200);
+
+    cerrarTodoForzado();
+
+    mostrarEnLCD("LLUVIA ACTIVA", "CASA CERRADA");
+    estadoAnteriorSonido = digitalRead(SENSOR_SONIDO);
+  }
+
+  // --- 7. SENSOR ULTRASÓNICO ANTIRROBO (A1 / A2) -> CIERRA FORZADO LOS 3 SERVOS ---
+  if (!emergenciaActiva && (millis() - ultimoChequeoUltrasonico >= 400)) {
+    ultimoChequeoUltrasonico = millis();
+    long distancia = medirDistanciaCM();
+
+    if (distancia > 0 && distancia <= DISTANCIA_ROBO) {
+      Serial.print("🚨 ¡INTRUSO DETECTADO A ");
+      Serial.print(distancia);
+      Serial.println(" CM! Cerrando puerta, ventana y barrera...");
+
+      mostrarEnLCD("! ALERTA ROBO !", "INTRUSO A " + String(distancia) + " CM");
+      
+      digitalWrite(LED_BLANCO, HIGH);
+      luzBlancaEncendida = true;
+
+      for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_ROJO, HIGH);
+        tone(BUZZER_PIN, 1800);
+        delay(120);
+        digitalWrite(LED_ROJO, LOW);
+        tone(BUZZER_PIN, 1100);
+        delay(120);
+      }
+      noTone(BUZZER_PIN);
+      digitalWrite(LED_ROJO, HIGH);
+
+      // Fuerza el cierre de Puerta, Ventana (Pin 9) y Barrera
+      cerrarTodoForzado();
+
+      mostrarEnLCD("CASA BLOQUEADA", "ACCESOS CERRADOS");
+      delay(1500);
+      estadoAnteriorSonido = digitalRead(SENSOR_SONIDO);
+    }
+  }
+
+  // --- 8. TEMPERATURA DHT11 (A3) Y MOTOR VENTILADOR (PIN 13) CADA 2 SEGUNDOS ---
+  if (millis() - ultimoReporteClima >= 2000) {
+    ultimoReporteClima = millis();
+
+    float humedad = dht.readHumidity();
+    float temperatura = dht.readTemperature();
+    long distActual = medirDistanciaCM();
+
+    if (!isnan(temperatura) && !isnan(humedad)) {
+      Serial.print("Temp: ");
+      Serial.print(temperatura, 1);
+      Serial.print(" °C | Hum: ");
+      Serial.print(humedad, 0);
+      Serial.print("% | Vent: ");
+      Serial.print(ventiladorEncendido ? "ON" : "OFF");
+      Serial.print(" | Radar Exterior: ");
+      if (distActual == 999) {
+        Serial.println("Despejado");
+      } else {
+        Serial.print(distActual);
+        Serial.println(" cm");
+      }
+
+      if (!emergenciaActiva) {
+        if (temperatura >= TEMP_MAXIMA && !ventiladorEncendido) {
+          ventiladorEncendido = true;
+          digitalWrite(PIN_VENTILADOR, HIGH);
+          mostrarEnLCD("TEMP ALTA: " + String(temperatura, 0) + "C", "VENTILADOR: ON");
+          delay(200);
+          estadoAnteriorSonido = digitalRead(SENSOR_SONIDO);
+        }
+        else if (temperatura < (TEMP_MAXIMA - 1.0) && ventiladorEncendido) {
+          ventiladorEncendido = false;
+          digitalWrite(PIN_VENTILADOR, LOW);
+          mostrarEnLCD("TEMP NORMAL: " + String(temperatura, 0) + "C", "VENTILADOR: OFF");
+          delay(200);
+          estadoAnteriorSonido = digitalRead(SENSOR_SONIDO);
+        }
+      }
+    }
+  }
+}
