@@ -1,0 +1,60 @@
+/*
+ * SISTEMA INDEPENDIENTE DE SEGURIDAD (SEGUNDO ARDUINO)
+ * Componentes: Sensor de flama (A0), LED RGB (D9, D10), Buzzer de 3 pines (D8)
+ * Autor: Tadeo Andrei Nieto Paz
+ */
+
+const int PIN_FLAMA = A0;   // Sensor de flama en A0
+const int BUZZER = 8;       // Pin digital 8 para la señal del Buzzer
+const int LED_ROJO = 9;     // Pin PWM 9 para el color rojo del LED RGB
+const int LED_VERDE = 10;   // Pin PWM 10 para el color verde del LED RGB
+
+const int UMBRAL_FUEGO = 500; // Umbral de detección analógica
+
+void setup() {
+  Serial.begin(9600);
+  
+  pinMode(PIN_FLAMA, INPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(LED_ROJO, OUTPUT);
+  pinMode(LED_VERDE, OUTPUT);
+  
+  // Estado inicial seguro
+  digitalWrite(LED_ROJO, LOW);
+  digitalWrite(LED_VERDE, HIGH);
+  noTone(BUZZER);
+  
+  Serial.println("=== NODO DE SEGURIDAD LISTO (FLAMA + RGB + BUZZER) ===");
+}
+
+void loop() {
+  int lecturaFlama = analogRead(PIN_FLAMA);
+
+  // Muestra la lectura en el Monitor Serial para calibrar
+  Serial.print("Lectura de Flama (A0): ");
+  Serial.println(lecturaFlama);
+
+  // Si detecta fuego (la lectura analógica cae por debajo del umbral)
+  if (lecturaFlama < UMBRAL_FUEGO) {
+    // Alerta de Fuego: LED en Rojo y Buzzer intermitente
+    digitalWrite(LED_ROJO, HIGH);
+    digitalWrite(LED_VERDE, LOW);
+    
+    tone(BUZZER, 1500); // Tono de alarma
+    delay(150);
+    
+    digitalWrite(LED_ROJO, LOW);
+    digitalWrite(LED_VERDE, LOW);
+    
+    noTone(BUZZER);
+    delay(150);
+  } 
+  else {
+    // Estado Normal: LED en Verde fijo y Buzzer apagado
+    digitalWrite(LED_ROJO, LOW);
+    digitalWrite(LED_VERDE, HIGH);
+    noTone(BUZZER);
+    
+    delay(200); // Pausa corta para estabilidad
+  }
+}
